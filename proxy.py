@@ -1,7 +1,7 @@
 from __future__ import print_function
 import argparse
 import sys
-from twisted.internet import reactor, protocol
+from twisted.internet import reactor, protocol, defer
 
 
 def _print(*parts):
@@ -10,51 +10,60 @@ def _print(*parts):
     sys.stdout.flush()
 
 
-class ClientProtocol(protocol.Protocol):
-    def __init__(self, conn_id):
-        self.conn_id = conn_id
+class ProxyClientProtocol(protocol.Protocol):
+    def connectionMade(self):
+        self.cli_queue = self.factory.cli_queue
+        self.cli_queue.get().addCallback(self.serverDataReceived)
 
-    def dataReceived(self, data):
-        _print("server %s" % self.conn_id, data)
-        self.server_protocol.transport.write(data)
+    def serverDataReceived(self, chunk):
+        if chunk is False:
+            self.cli_queue = None
+            self.factory.continueTrying = False
+            self.transport.loseConnection()
+        elif self.cli_queue:
+            self.transport.write(chunk)
+            self.cli_queue.get().addCallback(self.serverDataReceived)
+        else:
+            self.factory.cli_queue.put(chunk)
 
-    def connectionLost(self, reason):
-        self.server_protocol.transport.loseConnection()
+    def dataReceived(self, chunk):
+        _print('server', chunk)
+        self.factory.srv_queue.put(chunk)
 
-
-class ClientFactory(protocol.ClientFactory):
-    def __init__(self, server_protocol):
-        self.server_protocol = server_protocol
-
-    def buildProtocol(self, addr):
-        client_protocol = ClientProtocol(self.server_protocol.conn_id)
-        client_protocol.server_protocol = self.server_protocol
-        self.server_protocol.client_protocol = client_protocol
-        return client_protocol
-
-
-class ServerProtocol(protocol.Protocol):
-    def __init__(self, conn_id):
-        self.conn_id = conn_id
-
-    def dataReceived(self, data):
-        _print("client %d" % self.conn_id, data)
-        self.client_protocol.transport.write(data)
-
-    def connectionLost(self, reason):
-        self.client_protocol.transport.loseConnection()
+    def connectionLost(self, why):
+        if self.cli_queue:
+            self.cli_queue = None
 
 
-class ServerFactory(protocol.Factory):
-    def __init__(self):
-        self.conn_counter = 0
+class ProxyClientFactory(protocol.ReconnectingClientFactory):
+    maxDelay = 10
+    continueTrying = True
+    protocol = ProxyClientProtocol
 
-    def buildProtocol(self, addr):
-        conn_id = self.conn_counter
-        self.conn_counter += 1
-        server_protocol = ServerProtocol(conn_id)
-        reactor.connectTCP(args.connect_host, args.connect_port, ClientFactory(server_protocol))
-        return server_protocol
+    def __init__(self, srv_queue, cli_queue):
+        self.srv_queue = srv_queue
+        self.cli_queue = cli_queue
+
+
+class ProxyServer(protocol.Protocol):
+    def connectionMade(self):
+        self.srv_queue = defer.DeferredQueue()
+        self.cli_queue = defer.DeferredQueue()
+        self.srv_queue.get().addCallback(self.clientDataReceived)
+
+        factory = ProxyClientFactory(self.srv_queue, self.cli_queue)
+        reactor.connectTCP(args.connect_host, args.connect_port, factory)
+
+    def clientDataReceived(self, chunk):
+        self.transport.write(chunk)
+        self.srv_queue.get().addCallback(self.clientDataReceived)
+
+    def dataReceived(self, chunk):
+        _print('client', chunk)
+        self.cli_queue.put(chunk)
+
+    def connectionLost(self, why):
+        self.cli_queue.put(False)
 
 
 parser = argparse.ArgumentParser()
@@ -64,7 +73,8 @@ parser.add_argument('connect_port', type=int)
 
 args = parser.parse_args()
 
-reactor.listenTCP(args.listen_port, ServerFactory())
+factory = protocol.Factory()
+factory.protocol = ProxyServer
+reactor.listenTCP(args.listen_port, factory, interface="0.0.0.0")
 reactor.run()
-
 

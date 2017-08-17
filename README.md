@@ -1,8 +1,12 @@
 # Twisted TCP Proxy
 
+    Alexandre Fiori <fiorix@gmail.com>
     Ondrej Sika <ondrej@ondrejsika.com>
 
 Simple TCP proxy prints communication between server and client. Build for testing Stratum protocol.
+
+Based on <https://gist.github.com/fiorix/1878983>
+
 
 ## Install
 
